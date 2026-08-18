@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Test Cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Logs
+logs/*.log
+*.log
+mindwave_visualizer/logs/*.log
+
+# Data recordings (keep directory with .gitkeep)
+data/recordings/*.csv
+!data/recordings/.gitkeep
+mindwave_visualizer/data/recordings/*.csv
+!mindwave_visualizer/data/recordings/.gitkeep
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
