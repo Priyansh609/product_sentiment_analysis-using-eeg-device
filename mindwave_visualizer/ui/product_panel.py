@@ -39,7 +39,7 @@ class ProductPanel(QFrame):
 
     # Signals
     experiment_started  = pyqtSignal(str)          # product_name
-    experiment_stopped  = pyqtSignal()
+    experiment_stopped  = pyqtSignal(str, str)     # product_name, confirmed_label ("" if none)
     label_applied       = pyqtSignal(str, str)     # product_name, label
 
     def __init__(self, parent=None) -> None:
@@ -50,6 +50,10 @@ class ProductPanel(QFrame):
         self._experiment_timer: Optional[QTimer] = None
         self._experiment_elapsed: int = 0
         self._experiment_duration: int = 30  # seconds
+        # The label actually confirmed by the participant for the CURRENT
+        # trial, via the end-of-trial dialog. None until they answer —
+        # never silently defaults to a combo-box selection.
+        self._confirmed_label: Optional[str] = None
 
         self._setup_ui()
 
@@ -161,7 +165,7 @@ class ProductPanel(QFrame):
 
         self._start_exp_btn = self._make_btn("▶ Start Experiment", self._start_experiment,
                                               accent=True)
-        self._stop_exp_btn = self._make_btn("⏹ Stop Experiment", self._stop_experiment)
+        self._stop_exp_btn = self._make_btn("⏹ Stop Experiment", self._on_stop_clicked)
         self._stop_exp_btn.setEnabled(False)
 
         exp_layout.addWidget(self._start_exp_btn)
@@ -177,12 +181,20 @@ class ProductPanel(QFrame):
         left_layout.addWidget(exp_group)
 
         # Label selector
-        label_group = QGroupBox("ML Label")
+        # NOTE: this combo is now a DISPLAY of the most recently confirmed
+        # trial label (set after the end-of-trial dialog), not an input —
+        # the actual label for each recorded trial is collected via a
+        # modal dialog when the experiment timer ends (see _tick /
+        # _prompt_for_label), so a trial is never silently labeled with
+        # whatever this combo happened to show.
+        label_group = QGroupBox("Last Trial Label")
         label_group.setStyleSheet(exp_group.styleSheet())
         label_layout = QVBoxLayout(label_group)
 
         self._label_combo = QComboBox()
+        self._label_combo.addItem("— none yet —")
         self._label_combo.addItems(LABELS)
+        self._label_combo.setEnabled(False)  # display-only
         self._label_combo.setStyleSheet(f"""
             QComboBox {{
                 background: {COLORS['background']};
@@ -199,7 +211,7 @@ class ProductPanel(QFrame):
         """)
         label_layout.addWidget(self._label_combo)
 
-        self._apply_label_btn = self._make_btn("🏷 Apply Label", self._apply_label)
+        self._apply_label_btn = self._make_btn("🏷 Relabel Manually", self._apply_label)
         label_layout.addWidget(self._apply_label_btn)
 
         left_layout.addWidget(label_group)
@@ -328,7 +340,13 @@ class ProductPanel(QFrame):
 
     @property
     def current_label(self) -> str:
-        return self._label_combo.currentText()
+        """
+        The label actually confirmed by the participant for the current
+        trial via the end-of-trial dialog. Empty string until they answer —
+        this is what dashboard.py stamps into recorded rows, so a trial
+        is never silently labeled before the participant has responded.
+        """
+        return self._confirmed_label or ""
 
     @property
     def is_experiment_active(self) -> bool:
@@ -429,6 +447,8 @@ class ProductPanel(QFrame):
         self._experiment_active = True
         self._experiment_elapsed = 0
         self._experiment_duration = self._duration_spin.value()
+        self._confirmed_label = None
+        self._label_combo.setCurrentIndex(0)  # "— none yet —"
         self._start_exp_btn.setEnabled(False)
         self._stop_exp_btn.setEnabled(True)
 
@@ -441,6 +461,11 @@ class ProductPanel(QFrame):
         self.experiment_started.emit(self.current_product_name or "Unknown")
 
     def _stop_experiment(self) -> None:
+        # Capture before flipping state, so the signal always reflects
+        # THIS trial's product, not whatever the panel shows afterward.
+        product_name = self.current_product_name or "Unknown"
+        confirmed_label = self._confirmed_label or ""
+
         self._experiment_active = False
         if self._experiment_timer:
             self._experiment_timer.stop()
@@ -448,7 +473,7 @@ class ProductPanel(QFrame):
 
         self._start_exp_btn.setEnabled(True)
         self._stop_exp_btn.setEnabled(False)
-        self.experiment_stopped.emit()
+        self.experiment_stopped.emit(product_name, confirmed_label)
 
     def _tick(self) -> None:
         self._experiment_elapsed += 1
@@ -457,12 +482,77 @@ class ProductPanel(QFrame):
         self._timer_label.setText(f"{mins:02d}:{secs:02d}")
 
         if self._experiment_elapsed >= self._experiment_duration:
-            self._stop_experiment()
+            # Pause the countdown display and ask the participant for
+            # their rating BEFORE stopping — recording (and therefore the
+            # label written to each row) is only stopped by
+            # _stop_experiment(), called after they answer. This is also
+            # why the label combo is not the input: the participant hasn't
+            # seen or thought about their rating until this moment.
+            self._experiment_timer.stop()
+            self._prompt_for_label()
+
+    def _prompt_for_label(self) -> None:
+        """
+        Ask the participant to rate the product they just watched, then
+        finalize the trial. Called when the countdown reaches zero (auto)
+        or when Stop Experiment is clicked manually (see _on_stop_clicked).
+        """
+        product = self.current_product_name or "this product"
+        label, ok = self._ask_label_dialog(product)
+
+        if ok and label:
+            self._confirmed_label = label
+            idx = self._label_combo.findText(label)
+            if idx >= 0:
+                self._label_combo.setCurrentIndex(idx)
+        else:
+            # Participant closed the dialog without answering — leave
+            # _confirmed_label as None rather than guessing. The trial's
+            # rows will have a blank label; it can be filled in later via
+            # "Relabel Manually" if the participant is asked again.
+            self._confirmed_label = None
+            self._label_combo.setCurrentIndex(0)
+
+        self._stop_experiment()
+
+    def _ask_label_dialog(self, product_name: str):
+        """
+        Modal Yes/No/Cancel-style rating dialog using the three real
+        labels. Returns (label_text_or_None, accepted_bool).
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Rate This Product")
+        box.setText(f"What did you think of:\n\n{product_name}")
+        box.setIcon(QMessageBox.Icon.Question)
+
+        buttons = {}
+        for label_text in LABELS:
+            btn = box.addButton(label_text, QMessageBox.ButtonRole.YesRole)
+            buttons[btn] = label_text
+
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked in buttons:
+            return buttons[clicked], True
+        return None, False
+
+    def _on_stop_clicked(self) -> None:
+        """Handler for the Stop Experiment button — also collects a label."""
+        if not self._experiment_active:
+            return
+        if self._experiment_timer:
+            self._experiment_timer.stop()
+        self._prompt_for_label()
 
     def _apply_label(self) -> None:
+        """
+        Manually re-emit a label for the current product (e.g. to correct
+        it after the fact). Does nothing if no real label has been
+        confirmed yet for this product.
+        """
         name = self.current_product_name
         label = self._label_combo.currentText()
-        if name:
+        if name and label in LABELS:
             self.label_applied.emit(name, label)
 
     def _clear_rankings(self) -> None:

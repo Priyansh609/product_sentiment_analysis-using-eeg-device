@@ -18,10 +18,13 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QFrame, QDockWidget, QTabWidget,
     QStatusBar, QMenuBar, QMenu, QToolBar, QMessageBox,
-    QApplication, QSplitter, QScrollArea, QSizePolicy,
+    QApplication, QSplitter, QScrollArea, QSizePolicy, QLineEdit,
 )
 
-from config import COLORS, SETTINGS_ORG, SETTINGS_APP, UPDATE_INTERVAL_MS
+from config import (
+    COLORS, SETTINGS_ORG, SETTINGS_APP, UPDATE_INTERVAL_MS,
+    DEFAULT_PARTICIPANT_ID,
+)
 from eeg_reader import EEGReader
 from simulator import EEGSimulator
 from recorder import Recorder
@@ -68,6 +71,21 @@ class Dashboard(QMainWindow):
         self._engine = EngagementEngine()
         self._simulation_mode = False
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        # True only when _on_experiment_started auto-started recording for
+        # the CURRENT experiment — lets _on_experiment_stopped know whether
+        # it's safe to auto-stop, without cutting off a manually-started
+        # recording session the person began before the experiment.
+        self._auto_started_recording = False
+        # Rows recorded during the CURRENT trial, held back from the
+        # recorder until the participant confirms a label at trial end.
+        # Live-streaming rows to the recorder while a trial is active
+        # can't work here: the label isn't known until the trial is over,
+        # and by the time it IS known the "is experiment active" window
+        # has already closed, so no row would ever receive it. Buffering
+        # and stamping every row with the final label before flushing
+        # avoids that race entirely, at the cost of a short delay (one
+        # trial's worth of rows) before they hit disk.
+        self._trial_buffer: list[dict] = []
 
         # ── Build UI ──────────────────────────────────────────────────
         self._apply_theme()
@@ -231,6 +249,35 @@ class Dashboard(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
+
+        # ── Participant section ──────────────────────────────────────
+        participant_card = CardFrame("PARTICIPANT")
+        pl = participant_card.content_layout
+
+        pid_row = QHBoxLayout()
+        pid_lbl = QLabel("ID:")
+        pid_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10px;")
+        self._participant_input = QLineEdit()
+        self._participant_input.setPlaceholderText("e.g. P001")
+        self._participant_input.setText(
+            self._settings.value("participant_id", DEFAULT_PARTICIPANT_ID)
+        )
+        self._participant_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLORS['background']};
+                color: {COLORS['text']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 3px;
+                padding: 4px;
+                font-size: 11px;
+            }}
+        """)
+        self._participant_input.editingFinished.connect(self._on_participant_id_changed)
+        pid_row.addWidget(pid_lbl)
+        pid_row.addWidget(self._participant_input, stretch=1)
+        pl.addLayout(pid_row)
+
+        layout.addWidget(participant_card)
 
         # ── Connection section ────────────────────────────────────────
         conn_card = CardFrame("CONNECTION")
@@ -443,6 +490,23 @@ class Dashboard(QMainWindow):
         self._statusbar.showMessage("Ready — connect to MindWave or enable Simulation Mode")
 
     # ═══════════════════════════════════════════════════════════════════
+    #  Participant
+    # ═══════════════════════════════════════════════════════════════════
+
+    @property
+    def participant_id(self) -> str:
+        """Current participant ID, falling back to the default if blank."""
+        pid = self._participant_input.text().strip()
+        return pid if pid else DEFAULT_PARTICIPANT_ID
+
+    def _on_participant_id_changed(self) -> None:
+        """Persist the participant ID as soon as the field loses focus."""
+        pid = self.participant_id
+        self._settings.setValue("participant_id", pid)
+        self._status_msg(f"Participant set to '{pid}'")
+        log.info("Participant ID set to '%s'", pid)
+
+    # ═══════════════════════════════════════════════════════════════════
     #  Connection Logic
     # ═══════════════════════════════════════════════════════════════════
 
@@ -520,15 +584,25 @@ class Dashboard(QMainWindow):
 
     def _on_data(self, data: dict) -> None:
         """Handle a decoded EEG packet."""
+        # Stamp participant_id on every row, unconditionally — unlike
+        # product_name/label/engagement_score (added later, only while an
+        # experiment is active), participant_id applies to the whole
+        # session regardless of whether a product trial is running.
+        data["participant_id"] = self.participant_id
+
         # Raw EEG → waveform buffer
         raw = data.get("raw_eeg", 0)
         if raw != 0 or "raw_eeg" in data:
             self._visualizer.raw_eeg_plot.append(raw)
 
         # eSense metrics (only when non-zero — they come ~1/sec)
-        att = data.get("attention", 0)
-        med = data.get("meditation", 0)
-        blink = data.get("blink_strength", 0)
+        # NOTE: these fields always exist in the dict now, but hold None
+        # until the first ASIC/eSense packet arrives (see packet_decoder's
+        # forward-fill fix) — `.get(key, 0)` does NOT catch that, since the
+        # key is present. `or 0` correctly treats None the same as missing.
+        att = data.get("attention") or 0
+        med = data.get("meditation") or 0
+        blink = data.get("blink_strength") or 0
 
         if att > 0 or med > 0:
             self._visualizer.attention_plot.append(att)
@@ -550,27 +624,34 @@ class Dashboard(QMainWindow):
         self._visualizer.raw_eeg_plot.set_signal_quality(sq)
 
         # Band powers
-        if data.get("delta", 0) > 0:
+        if (data.get("delta") or 0) > 0:
             self._band_panel.update_values(data)
 
-        # Engagement
-        if att > 0:
+        # Engagement — only computable once real eSense data is present
+        if att > 0 and self._product_panel.is_experiment_active:
+            engagement = self._engine.calculate(data)
+            self._engagement_value_label.setText(f"{engagement:.1f}")
+            session = self._engine.current_session
+            stats = session.summary() if session else None
+            self._product_panel.update_engagement(engagement, stats)
+            data["engagement_score"] = engagement
+        elif att > 0:
             engagement = self._engine.calculate(data)
             self._engagement_value_label.setText(f"{engagement:.1f}")
 
-            # Update product panel if experiment active
-            if self._product_panel.is_experiment_active:
-                session = self._engine.current_session
-                stats = session.summary() if session else None
-                self._product_panel.update_engagement(engagement, stats)
-
-                # Enrich data for neuro CSV
-                data["engagement_score"] = engagement
-                data["product_name"] = self._product_panel.current_product_name or ""
-                data["label"] = self._product_panel.current_label
-
         # Recording
-        self._recorder.enqueue(data)
+        if self._product_panel.is_experiment_active:
+            # product_name is known now; label is NOT — it's only
+            # confirmed when the trial ends (see _on_experiment_stopped).
+            # Every row for this trial is buffered here rather than
+            # enqueued immediately, then flushed all at once, stamped
+            # with the real label, once the participant answers.
+            # Stamping a blank/guessed label live is exactly the bug
+            # this buffering replaces.
+            data["product_name"] = self._product_panel.current_product_name or ""
+            self._trial_buffer.append(data)
+        else:
+            self._recorder.enqueue(data)
 
     def _on_raw_packet(self, raw_bytes: bytes, decoded: dict) -> None:
         self._packet_inspector.update_packet(raw_bytes, decoded)
@@ -612,6 +693,19 @@ class Dashboard(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
 
     def _start_recording(self) -> None:
+        if self.participant_id == DEFAULT_PARTICIPANT_ID:
+            reply = QMessageBox.question(
+                self, "No Participant ID",
+                "Participant ID is still set to the default "
+                f"('{DEFAULT_PARTICIPANT_ID}'). Recording without a real "
+                "participant ID makes this session hard to identify later.\n\n"
+                "Start recording anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         neuro = self._tabs.currentIndex() == 1  # Neuromarketing tab
         self._recorder.start_recording(neuro_mode=neuro)
         self._rec_start_btn.setEnabled(False)
@@ -652,15 +746,49 @@ class Dashboard(QMainWindow):
 
     def _on_experiment_started(self, product_name: str) -> None:
         self._engine.start_session(product_name)
+        self._trial_buffer = []  # start this trial with a clean buffer
+        # Only auto-stop later what we auto-start here — if recording was
+        # already running before this experiment began (e.g. the person
+        # started it manually to capture a baseline), leave it running
+        # when the experiment ends instead of cutting it off unexpectedly.
         if not self._recorder.is_recording:
             self._start_recording()
+            # _start_recording() can decline to start (e.g. the person
+            # clicked "No" on the missing-participant-ID warning), so
+            # check the recorder's actual state rather than assuming.
+            self._auto_started_recording = self._recorder.is_recording
+        else:
+            self._auto_started_recording = False
         self._status_msg(f"Experiment started: {product_name}")
 
-    def _on_experiment_stopped(self) -> None:
+    def _on_experiment_stopped(self, product_name: str, label: str) -> None:
         session = self._engine.end_session()
         rankings = self._engine.get_rankings()
         self._product_panel.update_rankings(rankings)
-        self._status_msg("Experiment stopped")
+
+        # Stamp every buffered row from this trial with the participant's
+        # actual, now-confirmed answer, then flush them to the recorder
+        # in order. This is the step that fixes the "label always blank"
+        # bug: rows are held exactly until this point, when the real
+        # label is finally known, rather than being written earlier with
+        # nothing (or a stale/guessed value) in the label column.
+        for row in self._trial_buffer:
+            row["product_name"] = row.get("product_name") or product_name
+            row["label"] = label
+            self._recorder.enqueue(row)
+        n_rows = len(self._trial_buffer)
+        self._trial_buffer = []
+
+        if n_rows:
+            log.info("Flushed %d row(s) for trial '%s' -> '%s'",
+                      n_rows, product_name, label or "(unlabeled)")
+
+        if self._auto_started_recording and self._recorder.is_recording:
+            self._stop_recording()
+            self._auto_started_recording = False
+            self._status_msg("Experiment stopped — recording saved")
+        else:
+            self._status_msg("Experiment stopped")
 
     def _on_label_applied(self, product_name: str, label: str) -> None:
         self._status_msg(f"Label '{label}' applied to '{product_name}'")

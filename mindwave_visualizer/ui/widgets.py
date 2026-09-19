@@ -430,13 +430,18 @@ class BandPowerPanel(QFrame):
             layout.addWidget(bar)
 
     def update_values(self, data: dict) -> None:
+        # Defensive: band-power fields can be None before the first
+        # ASIC/eSense packet arrives. The current caller in dashboard.py
+        # only invokes this once real values exist, but guarding here too
+        # means this method is safe to call from anywhere (tests, future
+        # code) without relying on that external guarantee.
         max_val = 1
         for name in BAND_NAMES:
-            v = data.get(name, 0)
+            v = data.get(name) or 0
             if v > max_val:
                 max_val = v
         for name in BAND_NAMES:
-            self._bars[name].set_value(data.get(name, 0), max_val)
+            self._bars[name].set_value(data.get(name) or 0, max_val)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -110,12 +110,16 @@ class EngagementEngine:
         Compute engagement score (0 – 100) from a decoded packet.
         Only meaningful when attention > 0 (i.e. when eSense data is present).
         """
-        attention  = data.get("attention", 0)
-        low_beta   = data.get("low_beta", 0)
-        high_beta  = data.get("high_beta", 0)
-        low_alpha  = data.get("low_alpha", 0)
-        high_alpha = data.get("high_alpha", 0)
-        blink      = data.get("blink_strength", 0)
+        # NOTE: these keys always exist in the decoded dict, but hold None
+        # until the first ASIC/eSense packet arrives (see packet_decoder's
+        # forward-fill fix) — `.get(key, 0)` does NOT catch that, since the
+        # key is present. `or 0` correctly treats None the same as missing.
+        attention  = data.get("attention") or 0
+        low_beta   = data.get("low_beta") or 0
+        high_beta  = data.get("high_beta") or 0
+        low_alpha  = data.get("low_alpha") or 0
+        high_alpha = data.get("high_alpha") or 0
+        blink      = data.get("blink_strength") or 0
 
         # Beta / Alpha ratio (clamped to 0-100)
         alpha_sum = max(low_alpha + high_alpha, 1)
@@ -144,7 +148,7 @@ class EngagementEngine:
         if self._current_session is not None and attention > 0:
             s = self._current_session
             s.attention_values.append(attention)
-            s.meditation_values.append(data.get("meditation", 0))
+            s.meditation_values.append(data.get("meditation") or 0)
             s.engagement_values.append(engagement)
             s.data_points += 1
             if blink > 0:

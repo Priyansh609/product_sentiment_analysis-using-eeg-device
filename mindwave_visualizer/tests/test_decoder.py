@@ -32,7 +32,7 @@ class TestThinkGearParser:
     def test_empty_packet_template(self):
         pkt = empty_packet()
         assert pkt["signal_quality"] == 200
-        assert pkt["attention"] == 0
+        assert pkt["attention"] is None
         assert pkt["raw_eeg"] == 0
 
     def test_raw_eeg_packet(self):

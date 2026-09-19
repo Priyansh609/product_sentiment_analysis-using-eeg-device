@@ -57,6 +57,9 @@ LOG_BACKUP_COUNT = 5
 SETTINGS_ORG = "NeuroSkyVisualizer"
 SETTINGS_APP = "MindWaveVisualizer"
 
+# ── Participant ────────────────────────────────────────────────────────
+DEFAULT_PARTICIPANT_ID = "UNKNOWN"
+
 # ── Engagement Engine ─────────────────────────────────────────────────────
 ENGAGEMENT_WEIGHT_ATTENTION = 0.5
 ENGAGEMENT_WEIGHT_BETA      = 0.3
@@ -64,7 +67,7 @@ ENGAGEMENT_WEIGHT_BLINK     = 0.2
 
 # ── CSV Columns ───────────────────────────────────────────────────────────
 CSV_COLUMNS = [
-    "timestamp", "raw_eeg", "attention", "meditation",
+    "timestamp", "participant_id", "raw_eeg", "attention", "meditation",
     "signal_quality", "blink_strength",
     "delta", "theta", "low_alpha", "high_alpha",
     "low_beta", "high_beta", "low_gamma", "high_gamma",

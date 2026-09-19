@@ -53,22 +53,30 @@ log = setup_logger("decoder")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def empty_packet() -> dict:
-    """Return a data dict with every field set to its neutral default."""
+    """
+    Return a data dict with every field set to its neutral default.
+
+    Fields that come from the ~1 Hz ASIC/eSense stream (attention,
+    meditation, blink_strength, band powers) default to ``None`` rather
+    than ``0``, since 0 is a misleading stand-in for "not yet received".
+    ``None`` is written to CSV as a blank cell, which is distinguishable
+    from a genuine reading of zero during later ML preprocessing.
+    """
     return {
         "timestamp":       "",
         "raw_eeg":         0,
-        "attention":       0,
-        "meditation":      0,
+        "attention":       None,
+        "meditation":      None,
         "signal_quality":  200,   # 200 = no contact
-        "blink_strength":  0,
-        "delta":           0,
-        "theta":           0,
-        "low_alpha":       0,
-        "high_alpha":      0,
-        "low_beta":        0,
-        "high_beta":       0,
-        "low_gamma":       0,
-        "high_gamma":      0,
+        "blink_strength":  None,
+        "delta":           None,
+        "theta":           None,
+        "low_alpha":       None,
+        "high_alpha":      None,
+        "low_beta":        None,
+        "high_beta":       None,
+        "low_gamma":       None,
+        "high_gamma":      None,
     }
 
 
@@ -109,6 +117,25 @@ class ThinkGearParser:
 
         # Last raw packet bytes (for the inspector panel)
         self.last_raw_packet: bytes = b""
+
+        # Forward-fill state: the most recent *valid* value seen for each
+        # ASIC/eSense metric. These arrive at ~1 Hz, while raw EEG packets
+        # arrive at ~512 Hz, so every packet in between should carry the
+        # latest known metric values rather than resetting them to 0.
+        # Starts as None (never received) until the first real reading.
+        self.last_metrics: dict = {
+            "attention":      None,
+            "meditation":     None,
+            "blink_strength": None,
+            "delta":          None,
+            "theta":          None,
+            "low_alpha":      None,
+            "high_alpha":     None,
+            "low_beta":       None,
+            "high_beta":      None,
+            "low_gamma":      None,
+            "high_gamma":     None,
+        }
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -188,8 +215,20 @@ class ThinkGearParser:
     # ── payload parser ─────────────────────────────────────────────────
 
     def _parse_payload(self, payload: bytearray) -> dict:
-        """Parse a validated payload into a data dictionary."""
+        """
+        Parse a validated payload into a data dictionary.
+
+        Raw EEG packets (code 0x80) carry *only* the raw wave sample —
+        they say nothing about attention/meditation/band powers. Rather
+        than blanking those fields to 0 on every such packet, this method
+        seeds the row from ``self.last_metrics`` (the latest value this
+        parser has actually seen for each field, or None if it hasn't
+        seen one yet) and then overwrites individual fields as this
+        specific payload provides fresh values, updating last_metrics
+        to match so later packets keep inheriting the newest reading.
+        """
         data = empty_packet()
+        data.update(self.last_metrics)          # forward-fill 1 Hz metrics
         data["signal_quality"] = self.last_signal_quality
         data["timestamp"] = datetime.now().isoformat(timespec="milliseconds")
         i = 0
@@ -224,16 +263,13 @@ class ThinkGearParser:
                     for j in range(8):
                         b0, b1, b2 = value_bytes[j * 3 : j * 3 + 3]
                         bands.append((b0 << 16) | (b1 << 8) | b2)
-                    (
-                        data["delta"],
-                        data["theta"],
-                        data["low_alpha"],
-                        data["high_alpha"],
-                        data["low_beta"],
-                        data["high_beta"],
-                        data["low_gamma"],
-                        data["high_gamma"],
-                    ) = bands
+                    band_names = (
+                        "delta", "theta", "low_alpha", "high_alpha",
+                        "low_beta", "high_beta", "low_gamma", "high_gamma",
+                    )
+                    for name, value in zip(band_names, bands):
+                        data[name] = value
+                        self.last_metrics[name] = value
                 else:
                     log.debug("Unknown extended code 0x%02X (len=%d)", code, length)
 
@@ -249,9 +285,15 @@ class ThinkGearParser:
                     data["signal_quality"] = value
                 elif code == CODE_ATTENTION:
                     data["attention"] = value
+                    self.last_metrics["attention"] = value
                 elif code == CODE_MEDITATION:
                     data["meditation"] = value
+                    self.last_metrics["meditation"] = value
                 elif code == CODE_BLINK:
+                    # Blink is event-based (fires once per blink), not a
+                    # continuous 1 Hz metric — do NOT forward-fill this
+                    # into last_metrics, or every subsequent row would
+                    # falsely repeat the same blink event.
                     data["blink_strength"] = value
                 else:
                     log.debug("Unknown single-byte code 0x%02X = %d", code, value)
