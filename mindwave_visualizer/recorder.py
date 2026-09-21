@@ -57,19 +57,39 @@ class Recorder(QThread):
 
     # ── Public API (called from UI thread) ─────────────────────────────
 
-    def start_recording(self, neuro_mode: bool = False) -> None:
-        """Begin a new CSV recording session."""
+    def start_recording(self, neuro_mode: bool = False,
+                         filename_override: Optional[str] = None) -> None:
+        """
+        Begin a new CSV recording session.
+
+        filename_override, when given, is used as the CSV's base filename
+        (a ".csv" extension is added if not already present) instead of
+        the default "<prefix>_<timestamp>.csv" pattern — used for
+        per-trial recordings named "<ParticipantID>_<ProductName>.csv",
+        which intentionally OVERWRITE any existing file of the same name
+        if that participant/product combination is re-recorded.
+        """
         os.makedirs(RECORDING_DIR, exist_ok=True)
 
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        prefix = "neuro" if neuro_mode else "eeg"
-        self._filepath = os.path.join(RECORDING_DIR, f"{prefix}_{ts}.csv")
+        if filename_override:
+            safe_name = self._sanitize_filename(filename_override)
+            if not safe_name.lower().endswith(".csv"):
+                safe_name += ".csv"
+            self._filepath = os.path.join(RECORDING_DIR, safe_name)
+        else:
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            prefix = "neuro" if neuro_mode else "eeg"
+            self._filepath = os.path.join(RECORDING_DIR, f"{prefix}_{ts}.csv")
+
         self._neuro_mode = neuro_mode
         self._row_count = 0
         self._start_time = time.monotonic()
 
         try:
             columns = NEURO_CSV_COLUMNS if neuro_mode else CSV_COLUMNS
+            # "w" mode intentionally truncates/overwrites an existing file
+            # of the same name — this is the agreed behavior for re-doing
+            # a participant+product trial, not an accident.
             self._file = open(self._filepath, "w", newline="", encoding="utf-8")
             self._writer = csv.DictWriter(self._file, fieldnames=columns, extrasaction="ignore")
             self._writer.writeheader()
@@ -79,6 +99,14 @@ class Recorder(QThread):
         except OSError as exc:
             log.error("Failed to open recording file: %s", exc)
             self.recording_error.emit(str(exc))
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Strip characters that are invalid or risky in filenames on Windows."""
+        invalid = '<>:"/\\|?*'
+        cleaned = "".join(c for c in name if c not in invalid)
+        return cleaned.strip().strip(".") or "unnamed"
+
 
     def stop_recording(self) -> str | None:
         """

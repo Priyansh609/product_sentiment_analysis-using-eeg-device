@@ -71,11 +71,13 @@ class Dashboard(QMainWindow):
         self._engine = EngagementEngine()
         self._simulation_mode = False
         self._settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        # True only when _on_experiment_started auto-started recording for
-        # the CURRENT experiment — lets _on_experiment_stopped know whether
-        # it's safe to auto-stop, without cutting off a manually-started
-        # recording session the person began before the experiment.
-        self._auto_started_recording = False
+        # True when the CURRENT trial owns its own dedicated recording
+        # file (named "<ParticipantID>_<ProductName>.csv"), as opposed to
+        # a manual/general recording session already being in progress
+        # when the trial started (in which case the trial's rows flush
+        # into that existing file instead). Determines whether trial-end
+        # should also stop the recorder.
+        self._trial_uses_own_file = False
         # Rows recorded during the CURRENT trial, held back from the
         # recorder until the participant confirms a label at trial end.
         # Live-streaming rows to the recorder while a trial is active
@@ -704,10 +706,15 @@ class Dashboard(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
+                log.info("Recording NOT started — participant ID warning declined")
                 return
 
         neuro = self._tabs.currentIndex() == 1  # Neuromarketing tab
+        log.info("Starting recording: tab_index=%d neuro_mode=%s",
+                  self._tabs.currentIndex(), neuro)
         self._recorder.start_recording(neuro_mode=neuro)
+        log.info("Recorder.is_recording after start_recording(): %s, filepath=%s",
+                  self._recorder.is_recording, self._recorder.filepath)
         self._rec_start_btn.setEnabled(False)
         self._rec_stop_btn.setEnabled(True)
         self._rec_status_label.setText("● Recording…")
@@ -747,18 +754,34 @@ class Dashboard(QMainWindow):
     def _on_experiment_started(self, product_name: str) -> None:
         self._engine.start_session(product_name)
         self._trial_buffer = []  # start this trial with a clean buffer
-        # Only auto-stop later what we auto-start here — if recording was
-        # already running before this experiment began (e.g. the person
-        # started it manually to capture a baseline), leave it running
-        # when the experiment ends instead of cutting it off unexpectedly.
-        if not self._recorder.is_recording:
-            self._start_recording()
-            # _start_recording() can decline to start (e.g. the person
-            # clicked "No" on the missing-participant-ID warning), so
-            # check the recorder's actual state rather than assuming.
-            self._auto_started_recording = self._recorder.is_recording
+
+        # Every trial gets its OWN dedicated recording, named
+        # "<ParticipantID>_<ProductName>.csv" and always both started and
+        # stopped by the trial itself — this is a separate concern from
+        # the manual ⏺ Record button, which is for longer, free-form
+        # sessions. If manual recording also happens to be running (e.g.
+        # to capture a continuous multi-product baseline), that keeps
+        # running untouched; the trial's rows still go to their own file
+        # via the buffer-and-flush mechanism below, not to the manual one.
+        if self._recorder.is_recording:
+            # A manual/general recording is already active. Recorder only
+            # supports one open file at a time, so let that session keep
+            # owning the file — the trial's rows are still captured via
+            # the buffer below and will be labeled and flushed into it
+            # under the SAME manual file rather than a new per-trial one.
+            self._trial_uses_own_file = False
+            log.info("Experiment started for '%s'; manual recording already "
+                      "active, trial rows will flush into that file",
+                      product_name)
         else:
-            self._auto_started_recording = False
+            filename = f"{self.participant_id}_{product_name}"
+            neuro = True  # trials always need product_name/label/engagement columns
+            log.info("Starting per-trial recording: filename=%s", filename)
+            self._recorder.start_recording(neuro_mode=neuro, filename_override=filename)
+            self._trial_uses_own_file = True
+            if not self._recorder.is_recording:
+                log.warning("Per-trial recording failed to start for '%s'", filename)
+
         self._status_msg(f"Experiment started: {product_name}")
 
     def _on_experiment_stopped(self, product_name: str, label: str) -> None:
@@ -779,14 +802,20 @@ class Dashboard(QMainWindow):
         n_rows = len(self._trial_buffer)
         self._trial_buffer = []
 
-        if n_rows:
-            log.info("Flushed %d row(s) for trial '%s' -> '%s'",
-                      n_rows, product_name, label or "(unlabeled)")
+        log.info("Trial '%s' ended -> label='%s', flushing %d buffered row(s), "
+                  "recorder.is_recording=%s",
+                  product_name, label or "(unlabeled)", n_rows, self._recorder.is_recording)
 
-        if self._auto_started_recording and self._recorder.is_recording:
-            self._stop_recording()
-            self._auto_started_recording = False
-            self._status_msg("Experiment stopped — recording saved")
+        if self._trial_uses_own_file and self._recorder.is_recording:
+            path = self._recorder.stop_recording()
+            self._rec_start_btn.setEnabled(True)
+            self._rec_stop_btn.setEnabled(False)
+            self._rec_status_label.setText("Not recording")
+            self._rec_status_label.setStyleSheet(
+                f"color: {COLORS['text_secondary']}; font-size: 11px;"
+            )
+            self._rec_timer_label.setText("00:00")
+            self._status_msg(f"Trial saved: {os.path.basename(path) if path else ''}")
         else:
             self._status_msg("Experiment stopped")
 

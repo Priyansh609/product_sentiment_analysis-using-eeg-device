@@ -49,13 +49,22 @@ class ProductPanel(QFrame):
         self._experiment_active: bool = False
         self._experiment_timer: Optional[QTimer] = None
         self._experiment_elapsed: int = 0
-        self._experiment_duration: int = 30  # seconds
+        self._experiment_duration: int = 8  # seconds — fixed per-trial duration
         # The label actually confirmed by the participant for the CURRENT
         # trial, via the end-of-trial dialog. None until they answer —
         # never silently defaults to a combo-box selection.
         self._confirmed_label: Optional[str] = None
+        # Tracks whether the CURRENTLY DISPLAYED product has a completed,
+        # labeled trial yet. False the moment a new product is shown
+        # (including on Next/Prev/Randomize/initial load); set True only
+        # once that product's trial finishes and a label is confirmed.
+        # Next is disabled whenever this is False, so the participant
+        # cannot skip ahead without actually recording+labeling the
+        # product on screen.
+        self._current_trial_done: bool = False
 
         self._setup_ui()
+        self._update_nav_buttons()
 
     # ── UI construction ────────────────────────────────────────────────
 
@@ -146,7 +155,7 @@ class ProductPanel(QFrame):
         dur_label.setStyleSheet(f"color: {COLORS['text']}; font-size: 11px; border: none;")
         self._duration_spin = QSpinBox()
         self._duration_spin.setRange(5, 300)
-        self._duration_spin.setValue(30)
+        self._duration_spin.setValue(8)
         self._duration_spin.setStyleSheet(f"""
             QSpinBox {{
                 background: {COLORS['background']};
@@ -396,6 +405,7 @@ class ProductPanel(QFrame):
 
         if self._products and self._current_index < 0:
             self._product_list.setCurrentRow(0)
+        self._update_nav_buttons()
 
     def _remove_product(self) -> None:
         row = self._product_list.currentRow()
@@ -405,6 +415,13 @@ class ProductPanel(QFrame):
 
     def _on_product_selected(self, row: int) -> None:
         self._current_index = row
+        # A newly-shown product has no completed trial yet — gate Next
+        # until Start Experiment → 8s recording → label dialog all finish
+        # for THIS product.
+        self._current_trial_done = False
+        self._update_nav_buttons()
+        self._label_combo.setCurrentIndex(0)  # "— none yet —"
+
         if 0 <= row < len(self._products):
             product = self._products[row]
             self._product_name_label.setText(product["name"])
@@ -418,6 +435,18 @@ class ProductPanel(QFrame):
                 self._image_label.setPixmap(scaled)
             else:
                 self._image_label.setText("Cannot load image")
+
+    def _update_nav_buttons(self) -> None:
+        """
+        Next is only enabled once the currently displayed product's trial
+        has been recorded AND labeled. Prev is always allowed (going back
+        doesn't skip anything — re-doing a product overwrites its file,
+        per the agreed design), as is Randomize when not mid-trial.
+        """
+        at_last = self._current_index >= len(self._products) - 1
+        self._next_btn.setEnabled(self._current_trial_done and not at_last)
+        self._prev_btn.setEnabled(self._current_index > 0 and not self._experiment_active)
+        self._rand_btn.setEnabled(len(self._products) > 1 and not self._experiment_active)
 
     def _prev_product(self) -> None:
         if self._products:
@@ -451,6 +480,7 @@ class ProductPanel(QFrame):
         self._label_combo.setCurrentIndex(0)  # "— none yet —"
         self._start_exp_btn.setEnabled(False)
         self._stop_exp_btn.setEnabled(True)
+        self._update_nav_buttons()  # Prev/Randomize/Next all lock during a trial
 
         # Timer
         self._experiment_timer = QTimer()
@@ -473,6 +503,7 @@ class ProductPanel(QFrame):
 
         self._start_exp_btn.setEnabled(True)
         self._stop_exp_btn.setEnabled(False)
+        self._update_nav_buttons()
         self.experiment_stopped.emit(product_name, confirmed_label)
 
     def _tick(self) -> None:
@@ -498,32 +529,35 @@ class ProductPanel(QFrame):
         or when Stop Experiment is clicked manually (see _on_stop_clicked).
         """
         product = self.current_product_name or "this product"
-        label, ok = self._ask_label_dialog(product)
+        label, ok = self._ask_label_dialog(product)  # always answered — see _ask_label_dialog
 
-        if ok and label:
-            self._confirmed_label = label
-            idx = self._label_combo.findText(label)
-            if idx >= 0:
-                self._label_combo.setCurrentIndex(idx)
-        else:
-            # Participant closed the dialog without answering — leave
-            # _confirmed_label as None rather than guessing. The trial's
-            # rows will have a blank label; it can be filled in later via
-            # "Relabel Manually" if the participant is asked again.
-            self._confirmed_label = None
-            self._label_combo.setCurrentIndex(0)
+        self._confirmed_label = label
+        idx = self._label_combo.findText(label)
+        if idx >= 0:
+            self._label_combo.setCurrentIndex(idx)
+
+        # This product now has a completed, labeled trial — Next unlocks.
+        self._current_trial_done = True
+        self._update_nav_buttons()
 
         self._stop_experiment()
 
     def _ask_label_dialog(self, product_name: str):
         """
-        Modal Yes/No/Cancel-style rating dialog using the three real
-        labels. Returns (label_text_or_None, accepted_bool).
+        Modal rating dialog using the three real labels. Deliberately has
+        no Cancel/close option — Next stays blocked until a label is
+        confirmed, so the participant must pick one of the three buttons.
+        Returns (label_text_or_None, accepted_bool); accepted_bool is
+        always True here since there's no way to dismiss without picking.
         """
         box = QMessageBox(self)
         box.setWindowTitle("Rate This Product")
         box.setText(f"What did you think of:\n\n{product_name}")
         box.setIcon(QMessageBox.Icon.Question)
+        # No close button / Escape dismissal — a label is mandatory.
+        box.setWindowFlags(
+            box.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint
+        )
 
         buttons = {}
         for label_text in LABELS:
@@ -534,7 +568,10 @@ class ProductPanel(QFrame):
         clicked = box.clickedButton()
         if clicked in buttons:
             return buttons[clicked], True
-        return None, False
+        # Escape or some other dismissal path slipped through — re-ask
+        # rather than let an unlabeled trial through, per the design
+        # decision that Next stays blocked until a label is chosen.
+        return self._ask_label_dialog(product_name)
 
     def _on_stop_clicked(self) -> None:
         """Handler for the Stop Experiment button — also collects a label."""
